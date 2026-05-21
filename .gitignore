@@ -1,0 +1,64 @@
+# Виртуальное окружение
+.venv/
+venv/
+env/
+ENV/
+
+# VS Code
+.vscode/
+.history/
+
+# Python кеш файлы
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# PlatformIO (ваш проект)
+mik32_tinyml_firmware/.pio/
+mik32_tinyml_firmware/.pio-build/
+.pio/
+.pio-build/
+
+# Скомпилированные файлы
+*.pyc
+*.pyo
+*.pyd
+
+# Логи и временные файлы
+*.log
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Тестовые файлы (если они генерируются)
+tests.manifest.json
+tests.mktest
+
+# Кеш от PlatformIO тестов
+tools/testgen__pycache__/
+tools/runner/__pycache__/
+
+# Результаты компиляции
+*.hex
+*.bin
+*.elf
+*.map
+
+# Файлы загрузки/прошивки
+*.hex
+*.bin
+
+# IDE
+.idea/
+*.sublime-*
+
+# Секреты и конфигурации
+.env
+*.key
+*.pem
+*.crt
