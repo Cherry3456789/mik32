@@ -90,7 +90,6 @@ def flash(fw_dir="mik32_tinyml_firmware"):
 def hello(s: serial.Serial, retries: int = 10, timeout_s: float = 0.5) -> bool:
     for attempt in range(retries):
         seq = attempt + 1
-        s.reset_input_buffer()
         s.write(pack(MSG_HELLO, seq, b""))
         s.flush()
         frame = read_frame(s, timeout_s=timeout_s)

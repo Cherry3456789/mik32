@@ -6,15 +6,21 @@
 
 extern uint32_t mik32_millis(void);
 
+static uint8_t rx_buf[1200];
+static frame_t frame_in;
+
 static void send_simple(uint8_t type, uint16_t seq) {
-    frame_t out = {0};
-    out.type = type;
-    out.seq = seq;
-    out.len = 0;
-    uint8_t raw[16];
-    uint16_t raw_len = 0;
-    frame_encode(&out, raw, &raw_len);
-    transport_write(raw, raw_len);
+    uint8_t raw[8];
+    raw[0] = FRAME_START;
+    raw[1] = type;
+    raw[2] = (uint8_t)(seq & 0xFFu);
+    raw[3] = (uint8_t)(seq >> 8);
+    raw[4] = 0;
+    raw[5] = 0;
+    uint16_t crc = crc16_ccitt(&raw[1], 5);
+    raw[6] = (uint8_t)(crc & 0xFFu);
+    raw[7] = (uint8_t)(crc >> 8);
+    transport_write(raw, sizeof(raw));
 }
 
 int main(void) {
@@ -27,63 +33,58 @@ int main(void) {
         while (1) {}
     }
 
-    uint8_t rx[1200];
     uint16_t rx_len = 0;
-    uint8_t test_vec[MAX_TEST_VECTOR_BYTES];
     uint16_t test_len = 0;
 
     while (1) {
-        if (!transport_read_frame(rx, &rx_len, PROTO_TIMEOUT_MS)) {
+        if (!transport_read_frame(rx_buf, &rx_len, PROTO_TIMEOUT_MS)) {
             transport_write(banner, (uint16_t)(sizeof(banner) - 1));
             continue;
         }
-        frame_t in = {0};
-        if (!frame_decode(rx, rx_len, &in)) {
+        memset(&frame_in, 0, sizeof(frame_in));
+        if (!frame_decode(rx_buf, rx_len, &frame_in)) {
             send_simple(MSG_NACK, 0);
             continue;
         }
 
-        if (in.type == MSG_HELLO) {
-            send_simple(MSG_ACK, in.seq);
-        } else if (in.type == MSG_TEST_META) {
-            if (in.len >= 2) {
-                test_len = (uint16_t)(in.payload[0] | (in.payload[1] << 8));
+        if (frame_in.type == MSG_HELLO) {
+            send_simple(MSG_ACK, frame_in.seq);
+        } else if (frame_in.type == MSG_TEST_META) {
+            if (frame_in.len >= 2) {
+                test_len = (uint16_t)(frame_in.payload[0] | (frame_in.payload[1] << 8));
                 if (test_len > MAX_TEST_VECTOR_BYTES || test_len != shape.input_bytes) {
-                    send_simple(MSG_NACK, in.seq);
+                    send_simple(MSG_NACK, frame_in.seq);
                 } else {
-                    send_simple(MSG_ACK, in.seq);
+                    send_simple(MSG_ACK, frame_in.seq);
                 }
             } else {
-                send_simple(MSG_NACK, in.seq);
+                send_simple(MSG_NACK, frame_in.seq);
             }
-        } else if (in.type == MSG_TEST_CHUNK) {
-            uint16_t copy = in.len;
-            if (copy > test_len) copy = test_len;
-            memcpy(test_vec, in.payload, copy);
-
-            uint8_t logits[MAX_OUTPUT_BYTES] = {0};
+        } else if (frame_in.type == MSG_TEST_CHUNK) {
             uint16_t logits_len = (shape.output_bytes <= MAX_OUTPUT_BYTES) ? shape.output_bytes : MAX_OUTPUT_BYTES;
             uint32_t t0 = mik32_millis();
-            if (!tinyml_infer(test_vec, copy, logits, &logits_len)) {
-                send_simple(MSG_NACK, in.seq);
+            if (!tinyml_infer(frame_in.payload, frame_in.len, &rx_buf[10], &logits_len)) {
+                send_simple(MSG_NACK, frame_in.seq);
                 continue;
             }
             uint32_t duration_us = (mik32_millis() - t0) * 1000u;
 
-            frame_t out = {0};
-            out.type = MSG_INFER_RESULT;
-            out.seq = in.seq;
-            out.len = (uint16_t)(4u + logits_len);
-            out.payload[0] = (uint8_t)(duration_us & 0xFFu);
-            out.payload[1] = (uint8_t)((duration_us >> 8) & 0xFFu);
-            out.payload[2] = (uint8_t)((duration_us >> 16) & 0xFFu);
-            out.payload[3] = (uint8_t)((duration_us >> 24) & 0xFFu);
-            memcpy(&out.payload[4], logits, logits_len);
-            uint8_t raw[1200] = {0};
-            uint16_t raw_len = 0;
-            frame_encode(&out, raw, &raw_len);
-            transport_write(raw, raw_len);
-            send_simple(MSG_FINISH, in.seq);
+            uint16_t payload_len = (uint16_t)(4u + logits_len);
+            rx_buf[0] = FRAME_START;
+            rx_buf[1] = MSG_INFER_RESULT;
+            rx_buf[2] = (uint8_t)(frame_in.seq & 0xFFu);
+            rx_buf[3] = (uint8_t)(frame_in.seq >> 8);
+            rx_buf[4] = (uint8_t)(payload_len & 0xFFu);
+            rx_buf[5] = (uint8_t)(payload_len >> 8);
+            rx_buf[6] = (uint8_t)(duration_us & 0xFFu);
+            rx_buf[7] = (uint8_t)((duration_us >> 8) & 0xFFu);
+            rx_buf[8] = (uint8_t)((duration_us >> 16) & 0xFFu);
+            rx_buf[9] = (uint8_t)((duration_us >> 24) & 0xFFu);
+            uint16_t crc = crc16_ccitt(&rx_buf[1], (uint16_t)(5u + payload_len));
+            rx_buf[6 + payload_len] = (uint8_t)(crc & 0xFFu);
+            rx_buf[7 + payload_len] = (uint8_t)(crc >> 8);
+            transport_write(rx_buf, (uint16_t)(8u + payload_len));
+            send_simple(MSG_FINISH, frame_in.seq);
         }
     }
 }
