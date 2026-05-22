@@ -1,4 +1,15 @@
 #include "tinyml_runtime.h"
+
+/*
+ * Diagnostic stub runtime.
+ *
+ * This file does not execute TensorFlow Lite models. It only keeps the board
+ * protocol testable until a real TensorFlow Lite Micro runtime is linked in.
+ * Define TINYML_USE_STUB=1 explicitly to build this path.
+ */
+
+#if TINYML_USE_STUB
+
 #include "model_data.h"
 
 #define INPUT_BYTES (28u * 28u)
@@ -26,3 +37,9 @@ bool tinyml_infer(const uint8_t *input, uint16_t input_len, uint8_t *output, uin
     *output_len = OUTPUT_BYTES;
     return true;
 }
+
+#elif !TINYML_USE_TFLM
+
+#error "No TinyML runtime selected. Vendor TensorFlow Lite Micro and build with -DTINYML_USE_TFLM=1, or explicitly enable the diagnostic path with -DTINYML_USE_STUB=1."
+
+#endif

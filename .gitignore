@@ -21,6 +21,23 @@ mik32_tinyml_firmware/.pio-build/
 .pio/
 .pio-build/
 
+# Pipeline outputs and local artifacts
+runs/
+results.json
+*.manifest.json
+*.npz
+*.npy
+*.tflite
+
+# Vendored third-party sources are installed locally.
+# Keep only our PlatformIO library manifest for tflite-micro.
+mik32_tinyml_firmware/lib/tflite-micro/**
+!mik32_tinyml_firmware/lib/tflite-micro/
+!mik32_tinyml_firmware/lib/tflite-micro/library.json
+mik32_tinyml_firmware/lib/flatbuffers/**
+
+Thumbs.db
+
 # Скомпилированные файлы
 *.pyc
 *.pyo
@@ -62,6 +79,3 @@ tools/runner/__pycache__/
 *.key
 *.pem
 *.crt
-
-results.json
-runs/

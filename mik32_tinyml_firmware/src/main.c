@@ -48,8 +48,11 @@ int main(void) {
         } else if (in.type == MSG_TEST_META) {
             if (in.len >= 2) {
                 test_len = (uint16_t)(in.payload[0] | (in.payload[1] << 8));
-                if (test_len > MAX_TEST_VECTOR_BYTES) test_len = MAX_TEST_VECTOR_BYTES;
-                send_simple(MSG_ACK, in.seq);
+                if (test_len > MAX_TEST_VECTOR_BYTES || test_len != shape.input_bytes) {
+                    send_simple(MSG_NACK, in.seq);
+                } else {
+                    send_simple(MSG_ACK, in.seq);
+                }
             } else {
                 send_simple(MSG_NACK, in.seq);
             }
@@ -58,8 +61,8 @@ int main(void) {
             if (copy > test_len) copy = test_len;
             memcpy(test_vec, in.payload, copy);
 
-            uint8_t logits[64] = {0};
-            uint16_t logits_len = sizeof(logits);
+            uint8_t logits[MAX_OUTPUT_BYTES] = {0};
+            uint16_t logits_len = (shape.output_bytes <= MAX_OUTPUT_BYTES) ? shape.output_bytes : MAX_OUTPUT_BYTES;
             uint32_t t0 = mik32_millis();
             if (!tinyml_infer(test_vec, copy, logits, &logits_len)) {
                 send_simple(MSG_NACK, in.seq);

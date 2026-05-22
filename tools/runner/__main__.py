@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 import csv
 import json
@@ -10,7 +12,10 @@ import time
 import uuid
 from pathlib import Path
 
-import serial
+try:
+    import serial
+except ImportError:
+    serial = None
 
 START = 0xAA
 MSG_HELLO = 0x01
@@ -59,6 +64,21 @@ def read_frame(s: serial.Serial, timeout_s: float = 2.0):
     return None
 
 
+def decode_tensor(data: bytes, dtype: str):
+    dtype = (dtype or "uint8").lower()
+    if dtype in ("uint8", "uint8_t"):
+        return list(data)
+    if dtype in ("int8", "int8_t"):
+        return list(struct.unpack(f"<{len(data)}b", data))
+    if dtype in ("float32", "float", "f32"):
+        n = len(data) // 4
+        return list(struct.unpack(f"<{n}f", data[: n * 4]))
+    if dtype in ("int32", "i32"):
+        n = len(data) // 4
+        return list(struct.unpack(f"<{n}i", data[: n * 4]))
+    raise RuntimeError(f"Unsupported output dtype: {dtype}")
+
+
 def build(fw_dir="mik32_tinyml_firmware"):
     subprocess.check_call([sys.executable, "-m", "platformio", "run"], cwd=fw_dir)
 
@@ -80,7 +100,9 @@ def hello(s: serial.Serial, retries: int = 10, timeout_s: float = 0.5) -> bool:
     return False
 
 
-def run_tests(port: str, test_file: str, out_json: str, baud=115200):
+def run_tests(port: str, test_file: str, out_json: str, baud=115200, output_dtype="uint8"):
+    if serial is None:
+        raise RuntimeError("pyserial is required: python -m pip install pyserial")
     b = Path(test_file).read_bytes()
     if b[:4] != b"MKT1":
         raise RuntimeError("Bad test format")
@@ -111,6 +133,7 @@ def run_tests(port: str, test_file: str, out_json: str, baud=115200):
             if not meta_resp or meta_resp["type"] != MSG_ACK:
                 raise RuntimeError(f"No ACK for META seq={seq}")
 
+
             s.write(pack(MSG_TEST_CHUNK, seq, vec))
             infer = read_frame(s)
             finish = read_frame(s)
@@ -121,21 +144,22 @@ def run_tests(port: str, test_file: str, out_json: str, baud=115200):
 
             duration_us = None
             payload = infer["payload"]
-            if len(payload) >= 14:
+            if len(payload) >= 4:
                 duration_us = struct.unpack("<I", payload[:4])[0]
                 payload = payload[4:]
-            logits = list(payload)
+            logits = decode_tensor(payload, output_dtype)
             pred = max(range(len(logits)), key=lambda k: logits[k]) if logits else -1
             row = {"id": i, "prediction": pred, "logits": logits}
             if duration_us is not None:
                 row["duration_us"] = duration_us
             results.append(row)
 
-
-    Path(out_json).write_text(json.dumps({"count": count, "vec_len": vec_len, "results": results}, indent=2))
+    Path(out_json).write_text(json.dumps({"count": count, "vec_len": vec_len, "output_dtype": output_dtype, "results": results}, indent=2))
 
 
 def probe(port: str, baud=115200, seconds=3.0):
+    if serial is None:
+        raise RuntimeError("pyserial is required: python -m pip install pyserial")
     with serial.Serial(port, baud, timeout=0.1, rtscts=False, dsrdtr=False) as s:
         s.setDTR(False)
         s.setRTS(False)
@@ -178,6 +202,83 @@ def write_model_data(model_path: Path, out_c: Path):
         "",
     ])
     out_c.write_text("\n".join(lines))
+
+
+def inspect_npz(dataset_path: Path, npz_key=None, npz_label_key=None):
+    if dataset_path.suffix.lower() != ".npz":
+        return {"kind": "file", "path": str(dataset_path)}
+    try:
+        import numpy as np
+    except Exception as exc:
+        return {"kind": "npz", "error": f"numpy is required to inspect npz: {exc}"}
+
+    loaded = np.load(dataset_path, allow_pickle=True)
+    keys = list(loaded.files)
+
+    def pick(preferred, fallback):
+        if preferred:
+            return preferred if preferred in loaded else None
+        for key in fallback:
+            if key in loaded:
+                return key
+        return keys[0] if keys else None
+
+    input_key = pick(npz_key, ("x", "X", "features", "vectors", "images", "data", "inputs", "texts", "text", "arr_0"))
+    label_key = pick(npz_label_key, ("y", "Y", "labels", "label", "target", "targets", "arr_1"))
+
+
+    info = {"kind": "npz", "keys": keys, "input_key": input_key, "label_key": label_key}
+    if input_key:
+        arr = loaded[input_key]
+        info["input_shape"] = list(arr.shape)
+        info["input_dtype"] = str(arr.dtype)
+        info["input_is_string"] = arr.dtype.kind in ("U", "S", "O")
+        if not info["input_is_string"] and arr.ndim >= 1:
+            sample_elements = int(arr[0].size) if arr.shape[0] else 0
+            info["sample_input_bytes"] = sample_elements * int(arr.dtype.itemsize)
+        if "metadata_json" in loaded:
+            try:
+                raw = loaded["metadata_json"].item()
+                info["metadata_json"] = json.loads(str(raw))
+            except Exception:
+                info["metadata_json"] = str(loaded["metadata_json"])
+    if label_key:
+        labels = loaded[label_key]
+        info["label_shape"] = list(labels.shape)
+        info["label_dtype"] = str(labels.dtype)
+        info["label_is_string"] = labels.dtype.kind in ("U", "S", "O")
+    if "logits" in loaded:
+        logits = loaded["logits"]
+        info["output_shape"] = list(logits.shape)
+        info["output_dtype"] = str(logits.dtype)
+    return info
+
+def inspect_tflite(model_path: Path):
+    data = model_path.read_bytes()
+    return {
+        "path": str(model_path),
+        "size_bytes": len(data),
+        "is_tflite": data.find(b"TFL3", 0, 16) >= 0,
+    }
+
+
+def write_unsupported_report(run_dir: Path, model_info, dataset_info, reasons):
+    fit = {
+        "supported": False,
+        "runtime": "tflite-micro",
+        "model": model_info,
+        "dataset": dataset_info,
+        "reasons": reasons,
+        "next_step": "Use a numeric dataset whose input tensor byte size matches the embedded TFLite model input.",
+    }
+    report = {
+        "status": "unsupported",
+        "accuracy": None,
+        "latency_us": None,
+        "fit": fit,
+    }
+    (run_dir / "fit.json").write_text(json.dumps(fit, indent=2))
+    (run_dir / "report.json").write_text(json.dumps(report, indent=2))
 
 
 def summarize(results_path: Path, manifest_path: Path | None, report_path: Path, csv_path: Path):
@@ -231,9 +332,30 @@ def run_pipeline(args):
     shutil.copyfile(args.model, model_dst)
     shutil.copyfile(args.dataset, dataset_dst)
 
+
+    model_info = inspect_tflite(model_dst)
+    dataset_info = inspect_npz(dataset_dst, npz_key=args.npz_key, npz_label_key=args.npz_label_key)
+    reasons = []
+    if not model_info["is_tflite"]:
+        reasons.append("model file does not look like a TFLite flatbuffer")
+    if dataset_info.get("input_is_string"):
+        reasons.append("dataset input is string; current board protocol/runtime expects fixed-size numeric byte vectors")
+    if dataset_info.get("label_is_string"):
+        reasons.append("dataset labels are strings; current metric code can only compare numeric class ids on board outputs")
+
+    if reasons:
+        write_unsupported_report(run_dir, model_info, dataset_info, reasons)
+        print(json.dumps({"run_id": run_id, "run_dir": str(run_dir), "status": "unsupported", "reasons": reasons}, indent=2))
+        raise SystemExit("Unsupported model/dataset for current firmware runtime")
+
     write_model_data(model_dst, Path(args.fw_dir) / "model" / "model_data.c")
 
     tests_path = run_dir / "tests.mktest"
+    vec_len = args.vec_len
+    if vec_len is None:
+        vec_len = dataset_info.get("sample_input_bytes")
+    if not vec_len:
+        raise SystemExit("Cannot infer --vec-len from dataset; pass it explicitly")
     testgen_cmd = [
         sys.executable,
         "-m",
@@ -244,7 +366,7 @@ def run_pipeline(args):
         "--output",
         str(tests_path),
         "--vec-len",
-        str(args.vec_len),
+        str(vec_len),
         "--count",
         str(args.count),
     ]
@@ -254,12 +376,14 @@ def run_pipeline(args):
         testgen_cmd += ["--npz-label-key", args.npz_label_key]
     subprocess.check_call(testgen_cmd)
 
-
     build(args.fw_dir)
     flash(args.fw_dir)
 
     results_path = run_dir / "results.json"
-    run_tests(args.port, str(tests_path), str(results_path), baud=args.baud)
+    output_dtype = args.output_dtype
+    if output_dtype == "auto":
+        output_dtype = dataset_info.get("output_dtype") or "uint8"
+    run_tests(args.port, str(tests_path), str(results_path), baud=args.baud, output_dtype=output_dtype)
 
     report = summarize(
         results_path,
@@ -268,6 +392,14 @@ def run_pipeline(args):
         run_dir / "predictions.csv",
     )
     print(json.dumps({"run_id": run_id, "run_dir": str(run_dir), "report": report}, indent=2))
+
+
+def model_info(args):
+    info = {
+        "model": inspect_tflite(Path(args.model)),
+        "dataset": inspect_npz(Path(args.dataset), npz_key=args.npz_key, npz_label_key=args.npz_label_key) if args.dataset else None,
+    }
+    print(json.dumps(info, indent=2))
 
 
 def main():
@@ -280,6 +412,7 @@ def main():
     r.add_argument("--tests", required=True)
     r.add_argument("--out", default="results.json")
     r.add_argument("--baud", type=int, default=int(os.getenv("MIK32_BAUD", "115200")))
+    r.add_argument("--output-dtype", default="uint8", choices=("uint8", "int8", "float32", "int32"))
     pr = sp.add_parser("probe")
     pr.add_argument("--port", required=True)
     pr.add_argument("--baud", type=int, default=int(os.getenv("MIK32_BAUD", "115200")))
@@ -290,12 +423,18 @@ def main():
     pipe.add_argument("--port", required=True)
     pipe.add_argument("--baud", type=int, default=int(os.getenv("MIK32_BAUD", "115200")))
     pipe.add_argument("--count", type=int, default=32)
-    pipe.add_argument("--vec-len", type=int, default=784)
+    pipe.add_argument("--vec-len", type=int)
     pipe.add_argument("--npz-key")
     pipe.add_argument("--npz-label-key")
+    pipe.add_argument("--output-dtype", default="auto", choices=("auto", "uint8", "int8", "float32", "int32"))
     pipe.add_argument("--runs-dir", default="runs")
     pipe.add_argument("--run-id")
     pipe.add_argument("--fw-dir", default="mik32_tinyml_firmware")
+    mi = sp.add_parser("model-info")
+    mi.add_argument("--model", required=True)
+    mi.add_argument("--dataset")
+    mi.add_argument("--npz-key")
+    mi.add_argument("--npz-label-key")
     a = p.parse_args()
 
     if a.cmd == "build":
@@ -303,11 +442,13 @@ def main():
     elif a.cmd == "flash":
         flash()
     elif a.cmd == "run-tests":
-        run_tests(a.port, a.tests, a.out, baud=a.baud)
+        run_tests(a.port, a.tests, a.out, baud=a.baud, output_dtype=a.output_dtype)
     elif a.cmd == "probe":
         probe(a.port, baud=a.baud, seconds=a.seconds)
-    else:
+    elif a.cmd == "run-pipeline":
         run_pipeline(a)
+    else:
+        model_info(a)
 
 
 if __name__ == "__main__":
