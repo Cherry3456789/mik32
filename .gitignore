@@ -64,3 +64,4 @@ tools/runner/__pycache__/
 *.crt
 
 results.json
+runs/

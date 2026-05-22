@@ -4,6 +4,8 @@
 #include "transport_serial.h"
 #include "tinyml_runtime.h"
 
+extern uint32_t mik32_millis(void);
+
 static void send_simple(uint8_t type, uint16_t seq) {
     frame_t out = {0};
     out.type = type;
@@ -56,18 +58,24 @@ int main(void) {
             if (copy > test_len) copy = test_len;
             memcpy(test_vec, in.payload, copy);
 
-            uint8_t outbuf[64] = {0};
-            uint16_t outlen = sizeof(outbuf);
-            if (!tinyml_infer(test_vec, copy, outbuf, &outlen)) {
+            uint8_t logits[64] = {0};
+            uint16_t logits_len = sizeof(logits);
+            uint32_t t0 = mik32_millis();
+            if (!tinyml_infer(test_vec, copy, logits, &logits_len)) {
                 send_simple(MSG_NACK, in.seq);
                 continue;
             }
+            uint32_t duration_us = (mik32_millis() - t0) * 1000u;
 
             frame_t out = {0};
             out.type = MSG_INFER_RESULT;
             out.seq = in.seq;
-            out.len = outlen;
-            memcpy(out.payload, outbuf, outlen);
+            out.len = (uint16_t)(4u + logits_len);
+            out.payload[0] = (uint8_t)(duration_us & 0xFFu);
+            out.payload[1] = (uint8_t)((duration_us >> 8) & 0xFFu);
+            out.payload[2] = (uint8_t)((duration_us >> 16) & 0xFFu);
+            out.payload[3] = (uint8_t)((duration_us >> 24) & 0xFFu);
+            memcpy(&out.payload[4], logits, logits_len);
             uint8_t raw[1200] = {0};
             uint16_t raw_len = 0;
             frame_encode(&out, raw, &raw_len);

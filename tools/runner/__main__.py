@@ -1,10 +1,13 @@
 import argparse
+import csv
 import json
 import os
+import shutil
 import struct
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 import serial
@@ -116,9 +119,18 @@ def run_tests(port: str, test_file: str, out_json: str, baud=115200):
             if not finish or finish["type"] != MSG_FINISH:
                 raise RuntimeError(f"No FINISH seq={seq}")
 
-            logits = list(infer["payload"])
+            duration_us = None
+            payload = infer["payload"]
+            if len(payload) >= 14:
+                duration_us = struct.unpack("<I", payload[:4])[0]
+                payload = payload[4:]
+            logits = list(payload)
             pred = max(range(len(logits)), key=lambda k: logits[k]) if logits else -1
-            results.append({"id": i, "prediction": pred, "logits": logits})
+            row = {"id": i, "prediction": pred, "logits": logits}
+            if duration_us is not None:
+                row["duration_us"] = duration_us
+            results.append(row)
+
 
     Path(out_json).write_text(json.dumps({"count": count, "vec_len": vec_len, "results": results}, indent=2))
 
@@ -150,6 +162,114 @@ def probe(port: str, baud=115200, seconds=3.0):
         print(f"hello: {'ok' if ok else 'no ack'}")
 
 
+def write_model_data(model_path: Path, out_c: Path):
+    data = model_path.read_bytes()
+    lines = [
+        '#include "model_data.h"',
+        "",
+        "const uint8_t model_data[] = {",
+    ]
+    for i in range(0, len(data), 12):
+        chunk = ", ".join(f"0x{x:02x}" for x in data[i : i + 12])
+        lines.append(f"    {chunk},")
+    lines.extend([
+        "};",
+        "const uint32_t model_data_len = sizeof(model_data);",
+        "",
+    ])
+    out_c.write_text("\n".join(lines))
+
+
+def summarize(results_path: Path, manifest_path: Path | None, report_path: Path, csv_path: Path):
+    data = json.loads(results_path.read_text())
+    results = data["results"]
+    labels = None
+    if manifest_path and manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text())
+        labels = manifest.get("labels")
+
+    durations = [r["duration_us"] for r in results if "duration_us" in r]
+    correct = None
+    accuracy = None
+    if labels:
+        n = min(len(labels), len(results))
+        correct = sum(1 for i in range(n) if int(labels[i]) == int(results[i]["prediction"]))
+        accuracy = correct / n if n else None
+
+    with csv_path.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["id", "prediction", "label", "correct", "duration_us", "logits"])
+        for r in results:
+            label = labels[r["id"]] if labels and r["id"] < len(labels) else ""
+            ok = int(label == r["prediction"]) if label != "" else ""
+            writer.writerow([r["id"], r["prediction"], label, ok, r.get("duration_us", ""), r["logits"]])
+
+    report = {
+        "count": data["count"],
+        "vec_len": data["vec_len"],
+        "latency_us": {
+            "min": min(durations) if durations else None,
+            "max": max(durations) if durations else None,
+            "avg": (sum(durations) / len(durations)) if durations else None,
+            "median": sorted(durations)[len(durations) // 2] if durations else None,
+        },
+        "accuracy": accuracy,
+        "correct": correct,
+        "has_labels": labels is not None,
+    }
+    report_path.write_text(json.dumps(report, indent=2))
+    return report
+
+
+def run_pipeline(args):
+    run_id = args.run_id or str(uuid.uuid4())
+    run_dir = Path(args.runs_dir) / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    model_dst = run_dir / "model.tflite"
+    dataset_dst = run_dir / Path(args.dataset).name
+    shutil.copyfile(args.model, model_dst)
+    shutil.copyfile(args.dataset, dataset_dst)
+
+    write_model_data(model_dst, Path(args.fw_dir) / "model" / "model_data.c")
+
+    tests_path = run_dir / "tests.mktest"
+    testgen_cmd = [
+        sys.executable,
+        "-m",
+        "tools.testgen",
+        "generate",
+        "--input",
+        str(dataset_dst),
+        "--output",
+        str(tests_path),
+        "--vec-len",
+        str(args.vec_len),
+        "--count",
+        str(args.count),
+    ]
+    if args.npz_key:
+        testgen_cmd += ["--npz-key", args.npz_key]
+    if args.npz_label_key:
+        testgen_cmd += ["--npz-label-key", args.npz_label_key]
+    subprocess.check_call(testgen_cmd)
+
+
+    build(args.fw_dir)
+    flash(args.fw_dir)
+
+    results_path = run_dir / "results.json"
+    run_tests(args.port, str(tests_path), str(results_path), baud=args.baud)
+
+    report = summarize(
+        results_path,
+        tests_path.with_suffix(".manifest.json"),
+        run_dir / "report.json",
+        run_dir / "predictions.csv",
+    )
+    print(json.dumps({"run_id": run_id, "run_dir": str(run_dir), "report": report}, indent=2))
+
+
 def main():
     p = argparse.ArgumentParser()
     sp = p.add_subparsers(dest="cmd", required=True)
@@ -164,6 +284,18 @@ def main():
     pr.add_argument("--port", required=True)
     pr.add_argument("--baud", type=int, default=int(os.getenv("MIK32_BAUD", "115200")))
     pr.add_argument("--seconds", type=float, default=3.0)
+    pipe = sp.add_parser("run-pipeline")
+    pipe.add_argument("--model", required=True)
+    pipe.add_argument("--dataset", required=True)
+    pipe.add_argument("--port", required=True)
+    pipe.add_argument("--baud", type=int, default=int(os.getenv("MIK32_BAUD", "115200")))
+    pipe.add_argument("--count", type=int, default=32)
+    pipe.add_argument("--vec-len", type=int, default=784)
+    pipe.add_argument("--npz-key")
+    pipe.add_argument("--npz-label-key")
+    pipe.add_argument("--runs-dir", default="runs")
+    pipe.add_argument("--run-id")
+    pipe.add_argument("--fw-dir", default="mik32_tinyml_firmware")
     a = p.parse_args()
 
     if a.cmd == "build":
@@ -172,8 +304,10 @@ def main():
         flash()
     elif a.cmd == "run-tests":
         run_tests(a.port, a.tests, a.out, baud=a.baud)
-    else:
+    elif a.cmd == "probe":
         probe(a.port, baud=a.baud, seconds=a.seconds)
+    else:
+        run_pipeline(a)
 
 
 if __name__ == "__main__":
