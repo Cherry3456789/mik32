@@ -17,6 +17,8 @@ static void send_simple(uint8_t type, uint16_t seq) {
 
 int main(void) {
     transport_init();
+    static const uint8_t banner[] = "MIK32_TINYML_READY\r\n";
+    transport_write(banner, (uint16_t)(sizeof(banner) - 1));
 
     tinyml_shape_t shape = {0};
     if (!tinyml_init(&shape)) {
@@ -30,6 +32,7 @@ int main(void) {
 
     while (1) {
         if (!transport_read_frame(rx, &rx_len, PROTO_TIMEOUT_MS)) {
+            transport_write(banner, (uint16_t)(sizeof(banner) - 1));
             continue;
         }
         frame_t in = {0};

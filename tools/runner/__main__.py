@@ -64,6 +64,19 @@ def flash(fw_dir="mik32_tinyml_firmware"):
     subprocess.check_call([sys.executable, "-m", "platformio", "run", "-t", "upload"], cwd=fw_dir)
 
 
+def hello(s: serial.Serial, retries: int = 10, timeout_s: float = 0.5) -> bool:
+    for attempt in range(retries):
+        seq = attempt + 1
+        s.reset_input_buffer()
+        s.write(pack(MSG_HELLO, seq, b""))
+        s.flush()
+        frame = read_frame(s, timeout_s=timeout_s)
+        if frame and frame["type"] == MSG_ACK and frame["seq"] == seq:
+            return True
+        time.sleep(0.1)
+    return False
+
+
 def run_tests(port: str, test_file: str, out_json: str, baud=115200):
     b = Path(test_file).read_bytes()
     if b[:4] != b"MKT1":
@@ -73,10 +86,17 @@ def run_tests(port: str, test_file: str, out_json: str, baud=115200):
     off = 12
 
     results = []
-    with serial.Serial(port, baud, timeout=0.2) as s:
-        s.write(pack(MSG_HELLO, 1, b""))
-        if not read_frame(s):
-            raise RuntimeError("No HELLO ack")
+    with serial.Serial(port, baud, timeout=0.2, rtscts=False, dsrdtr=False) as s:
+        s.setDTR(False)
+        s.setRTS(False)
+        time.sleep(0.3)
+        s.reset_input_buffer()
+        s.reset_output_buffer()
+
+        if not hello(s):
+            raise RuntimeError(
+                "No HELLO ack; run probe, reflash firmware, and check --baud/serial port"
+            )
 
         for i in range(count):
             seq = i + 2
@@ -103,6 +123,33 @@ def run_tests(port: str, test_file: str, out_json: str, baud=115200):
     Path(out_json).write_text(json.dumps({"count": count, "vec_len": vec_len, "results": results}, indent=2))
 
 
+def probe(port: str, baud=115200, seconds=3.0):
+    with serial.Serial(port, baud, timeout=0.1, rtscts=False, dsrdtr=False) as s:
+        s.setDTR(False)
+        s.setRTS(False)
+        time.sleep(0.3)
+        s.reset_input_buffer()
+        s.reset_output_buffer()
+
+        print(f"listening on {port} at {baud} for {seconds:.1f}s")
+        t0 = time.time()
+        raw = bytearray()
+        while time.time() - t0 < seconds:
+            chunk = s.read(256)
+            if chunk:
+                raw.extend(chunk)
+
+        if raw:
+            printable = bytes(raw).decode("ascii", errors="replace")
+            print(f"raw[{len(raw)}] hex={bytes(raw).hex(' ')}")
+            print(f"raw text: {printable!r}")
+        else:
+            print("raw: no bytes received")
+
+        ok = hello(s)
+        print(f"hello: {'ok' if ok else 'no ack'}")
+
+
 def main():
     p = argparse.ArgumentParser()
     sp = p.add_subparsers(dest="cmd", required=True)
@@ -113,14 +160,20 @@ def main():
     r.add_argument("--tests", required=True)
     r.add_argument("--out", default="results.json")
     r.add_argument("--baud", type=int, default=int(os.getenv("MIK32_BAUD", "115200")))
+    pr = sp.add_parser("probe")
+    pr.add_argument("--port", required=True)
+    pr.add_argument("--baud", type=int, default=int(os.getenv("MIK32_BAUD", "115200")))
+    pr.add_argument("--seconds", type=float, default=3.0)
     a = p.parse_args()
 
     if a.cmd == "build":
         build()
     elif a.cmd == "flash":
         flash()
-    else:
+    elif a.cmd == "run-tests":
         run_tests(a.port, a.tests, a.out, baud=a.baud)
+    else:
+        probe(a.port, baud=a.baud, seconds=a.seconds)
 
 
 if __name__ == "__main__":
